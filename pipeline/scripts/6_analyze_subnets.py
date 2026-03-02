@@ -16,6 +16,9 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+RAO_TO_TAO = 1e-9  # 1 TAO = 1e9 rao
+
+
 def log(msg: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{ts}] {msg}")
@@ -229,7 +232,7 @@ def detect_anomalies(subnets: list, validators_by_subnet: dict) -> list[Anomaly]
                 netuid=netuid,
                 name=name,
                 anomaly_type="TAO_FLOW_REVERSAL",
-                description=f"30d flow: {f30:.2f} TAO (positive) but 7d flow: {f7:.2f} TAO (reversal)",
+                description=f"30d flow: {f30*RAO_TO_TAO:+,.0f} TAO but 7d flow: {f7*RAO_TO_TAO:+,.0f} TAO (reversal)",
                 severity="MEDIUM",
             ))
 
@@ -239,7 +242,7 @@ def detect_anomalies(subnets: list, validators_by_subnet: dict) -> list[Anomaly]
                 netuid=netuid,
                 name=name,
                 anomaly_type="FLOW_SPIKE",
-                description=f"24h flow ({f24:.2f} TAO) is >50% of 7d flow ({f7:.2f} TAO)",
+                description=f"24h flow ({f24*RAO_TO_TAO:+,.0f} TAO) is >50% of 7d flow ({f7*RAO_TO_TAO:+,.0f} TAO)",
                 severity="LOW",
             ))
 
@@ -327,7 +330,7 @@ def detect_opportunities(scores: list[SubnetScore], subnets: list) -> list[Oppor
                     opportunity_type="FLOW_ACCELERATION",
                     confidence=conf,
                     description=f"TAO flow accelerating +{acceleration:.0f}% WoW vs monthly avg",
-                    reasoning=f"7d flow: {sc.tao_flow_7d:.2f} TAO vs monthly weekly avg: {monthly_rate:.2f} TAO. Score: {sc.composite_score:.1f}/10",
+                    reasoning=f"7d flow: {sc.tao_flow_7d*RAO_TO_TAO:+,.0f} TAO vs monthly weekly avg: {monthly_rate*RAO_TO_TAO:,.0f} TAO. Score: {sc.composite_score:.1f}/10",
                 ))
 
         # 2. High emission but negative recent flow (potential oversold)
@@ -338,7 +341,7 @@ def detect_opportunities(scores: list[SubnetScore], subnets: list) -> list[Oppor
                 opportunity_type="POTENTIAL_OVERSOLD",
                 confidence="LOW",
                 description=f"High emission ({sc.emission_pct:.6f}) but negative flows — potential oversold",
-                reasoning=f"Emission score: {sc.emission_score:.1f}/10. 7d flow: {sc.tao_flow_7d:.2f}, 30d: {sc.tao_flow_30d:.2f}",
+                reasoning=f"Emission score: {sc.emission_score:.1f}/10. 7d flow: {sc.tao_flow_7d*RAO_TO_TAO:+,.0f} TAO, 30d: {sc.tao_flow_30d*RAO_TO_TAO:+,.0f} TAO",
             ))
 
         # 3. Strong score with good validator health
@@ -360,7 +363,7 @@ def detect_opportunities(scores: list[SubnetScore], subnets: list) -> list[Oppor
                 opportunity_type="EARLY_GROWTH",
                 confidence="LOW",
                 description=f"Small subnet ({sc.active_keys} keys) with positive inflows",
-                reasoning=f"24h flow: {sc.tao_flow_24h:.2f}, 7d: {sc.tao_flow_7d:.2f}. Early-stage growth signal.",
+                reasoning=f"24h flow: {sc.tao_flow_24h*RAO_TO_TAO:+,.0f} TAO, 7d: {sc.tao_flow_7d*RAO_TO_TAO:+,.0f} TAO. Early-stage growth signal.",
             ))
 
     # Sort by confidence
@@ -415,13 +418,15 @@ def generate_report(scores: list[SubnetScore], anomalies: list[Anomaly],
     # Top 10 by score
     lines.append("")
     lines.append("TOP 10 SUBNETS BY COMPOSITE SCORE:")
-    lines.append(f"{'Rank':<5} {'NetUID':<7} {'Name':<25} {'Score':<7} {'Emission':<12} {'Flow(30d)':<14} {'Flow(7d)':<12} {'Risk'}")
-    lines.append("-" * 95)
+    lines.append(f"{'Rank':<5} {'NetUID':<7} {'Name':<25} {'Score':<7} {'Emission':<12} {'Flow(30d) TAO':<16} {'Flow(7d) TAO':<14} {'Risk'}")
+    lines.append("-" * 100)
     for i, sc in enumerate(scores[:10]):
         name = (sc.name[:22] + "...") if len(sc.name) > 25 else sc.name
+        f30_tao = sc.tao_flow_30d * RAO_TO_TAO
+        f7_tao = sc.tao_flow_7d * RAO_TO_TAO
         lines.append(
             f"{i+1:<5} {sc.netuid:<7} {name:<25} {sc.composite_score:<7.1f} "
-            f"{sc.emission_pct:<12.6f} {sc.tao_flow_30d:<14.2f} {sc.tao_flow_7d:<12.2f} {sc.risk_level}"
+            f"{sc.emission_pct:<12.6f} {f30_tao:<+16,.0f} {f7_tao:<+14,.0f} {sc.risk_level}"
         )
 
     # Anomalies
@@ -544,6 +549,15 @@ def main():
 
     # ── Save to DB ────────────────────────────────────────────────────────
     log("Saving analysis report to DB...")
+    # Convert scores to include TAO-denominated flows for dashboard
+    def score_to_dict(sc):
+        d = asdict(sc)
+        d["tao_flow_30d_tao"] = sc.tao_flow_30d * RAO_TO_TAO
+        d["tao_flow_7d_tao"] = sc.tao_flow_7d * RAO_TO_TAO
+        d["tao_flow_24h_tao"] = sc.tao_flow_24h * RAO_TO_TAO
+        d["ema_tao_flow_tao"] = sc.ema_tao_flow * RAO_TO_TAO
+        return d
+
     report_json = {
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "type": "subnet_investment_analysis",
@@ -551,8 +565,8 @@ def main():
         "n_anomalies": len(anomalies),
         "n_opportunities": len(opportunities),
         "n_risks": len(risks),
-        "top_subnets": [asdict(s) for s in scores[:20]],
-        "all_scores": [asdict(s) for s in scores],
+        "top_subnets": [score_to_dict(s) for s in scores[:20]],
+        "all_scores": [score_to_dict(s) for s in scores],
         "anomalies": [asdict(a) for a in anomalies],
         "opportunities": [asdict(o) for o in opportunities],
         "risks": risks,
