@@ -1,4 +1,4 @@
-import { db } from "@/lib/db";
+import { getDb } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +16,7 @@ interface Hypothesis {
 }
 
 async function getData() {
-  const res = await db.execute("SELECT report_json FROM analysis_reports ORDER BY timestamp DESC LIMIT 1");
+  const res = await getDb().execute("SELECT report_json FROM analysis_reports ORDER BY timestamp DESC LIMIT 1");
   if (res.rows.length === 0) return null;
   try {
     return JSON.parse(String(res.rows[0].report_json));

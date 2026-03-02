@@ -1,13 +1,13 @@
-import { db } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { PriceChart } from "@/components/Charts";
 
 export const dynamic = "force-dynamic";
 
 async function getData() {
   const [pricesRes, apiRes, countRes] = await Promise.all([
-    db.execute("SELECT timestamp, open, high, low, close, volume FROM tao_prices ORDER BY timestamp"),
-    db.execute("SELECT api_name, status, latency_ms, last_checked FROM api_status"),
-    db.execute("SELECT COUNT(*) as cnt, MIN(timestamp) as min_ts, MAX(timestamp) as max_ts FROM tao_prices"),
+    getDb().execute("SELECT timestamp, open, high, low, close, volume FROM tao_prices ORDER BY timestamp"),
+    getDb().execute("SELECT api_name, status, latency_ms, last_checked FROM api_status"),
+    getDb().execute("SELECT COUNT(*) as cnt, MIN(timestamp) as min_ts, MAX(timestamp) as max_ts FROM tao_prices"),
   ]);
 
   const prices = pricesRes.rows.map((r) => ({

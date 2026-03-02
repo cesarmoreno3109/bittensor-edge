@@ -1,4 +1,4 @@
-import { db } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { EquityCurveChart, DrawdownChart } from "@/components/Charts";
 
 export const dynamic = "force-dynamic";
@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 async function getData() {
   // For now, show latest price data formatted as basic equity curve
   // A real implementation would store backtest results in DB
-  const res = await db.execute("SELECT timestamp, close FROM tao_prices ORDER BY timestamp");
+  const res = await getDb().execute("SELECT timestamp, close FROM tao_prices ORDER BY timestamp");
 
   if (res.rows.length === 0) return { equity: [], drawdown: [], trades: [], stats: null };
 

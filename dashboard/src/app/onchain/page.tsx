@@ -1,13 +1,13 @@
-import { db } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { StakeFlowChart, EmissionChart } from "@/components/Charts";
 
 export const dynamic = "force-dynamic";
 
 async function getData() {
   const [eventsRes, emissionRes, flowRes] = await Promise.all([
-    db.execute("SELECT block_num, timestamp, event_type, subnet_id, amount, hotkey FROM staking_events ORDER BY timestamp DESC LIMIT 200"),
-    db.execute("SELECT subnet_id, emission_rate FROM subnet_info WHERE snapshot_ts = (SELECT MAX(snapshot_ts) FROM subnet_info) AND emission_rate IS NOT NULL ORDER BY subnet_id"),
-    db.execute(`
+    getDb().execute("SELECT block_num, timestamp, event_type, subnet_id, amount, hotkey FROM staking_events ORDER BY timestamp DESC LIMIT 200"),
+    getDb().execute("SELECT subnet_id, emission_rate FROM subnet_info WHERE snapshot_ts = (SELECT MAX(snapshot_ts) FROM subnet_info) AND emission_rate IS NOT NULL ORDER BY subnet_id"),
+    getDb().execute(`
       SELECT DATE(timestamp, 'unixepoch') as date,
         SUM(CASE WHEN event_type='StakeAdded' THEN amount ELSE 0 END) -
         SUM(CASE WHEN event_type='StakeRemoved' THEN amount ELSE 0 END) as net_flow
