@@ -1,0 +1,29 @@
+"""Centralized configuration for Bittensor Edge Discovery pipeline."""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Database ---
+TURSO_DB_URL = os.getenv("TURSO_DB_URL", "file:bittensor_edge.db")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+
+# --- CoinGecko ---
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+COINGECKO_RATE_LIMIT_SECONDS = 6  # Free tier: max 10 req/min
+
+# --- Subscan ---
+SUBSCAN_BASE = "https://bittensor.api.subscan.io/api/v2"
+SUBSCAN_RATE_LIMIT_SECONDS = 0.5  # 2 req/sec without API key
+
+# --- Bittensor RPC ---
+RPC_ENDPOINT = "https://entrypoint-finney.opentensor.ai"
+
+# --- TaoStats ---
+TAOSTATS_BASE = "https://api.taostats.io/api/v1"
+
+# --- Collection parameters ---
+PRICE_DAYS = 30
+MAX_EVENTS = 10000
+MAX_SUBNETS = 52

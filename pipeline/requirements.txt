@@ -1,0 +1,6 @@
+libsql-experimental
+pandas
+numpy
+scipy
+requests
+python-dotenv
