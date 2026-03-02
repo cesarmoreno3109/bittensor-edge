@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0a0a0f;
+  --surface: #12121a;
+  --border: #1e1e2e;
+  --text: #e0e0e8;
+  --muted: #8888a0;
+  --accent: #6366f1;
+  --green: #22c55e;
+  --red: #ef4444;
+  --yellow: #eab308;
+  --blue: #3b82f6;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter", system-ui, sans-serif;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem;
+}
+
+.badge-none { background: #ef444420; color: #ef4444; }
+.badge-low { background: #eab30820; color: #eab308; }
+.badge-medium { background: #3b82f620; color: #3b82f6; }
+.badge-high { background: #22c55e20; color: #22c55e; }
