@@ -14,7 +14,7 @@ COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 COINGECKO_RATE_LIMIT_SECONDS = 6  # Free tier: max 10 req/min
 
 # --- Subscan ---
-SUBSCAN_BASE = "https://bittensor.api.subscan.io/api/v2"
+SUBSCAN_BASE = "https://bittensor.api.subscan.io/api"
 SUBSCAN_RATE_LIMIT_SECONDS = 0.5  # 2 req/sec without API key
 
 # --- Bittensor RPC ---
