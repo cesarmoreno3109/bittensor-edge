@@ -11,6 +11,7 @@ import time
 import json
 import requests
 import traceback
+import threading
 from datetime import datetime, timezone
 from collections import deque
 
@@ -28,6 +29,8 @@ from sn64_config import (
     REPORT_INTERVAL_SECONDS,
     DAILY_SUMMARY_HOUR_UTC,
     RAO_TO_TAO,
+    DCA_MAX_TRANCHES,
+    DCA_COOLDOWN_HOURS,
     score_to_signal,
 )
 from sn64_signals import calculate_signal, detect_anomalies, IndicatorResult
@@ -39,6 +42,7 @@ from sn64_history import (
     get_daily_scores,
     get_portfolio,
     get_position_count,
+    get_last_buy_timestamp,
     execute_paper_buy,
     update_portfolio_pnl,
 )
@@ -401,44 +405,424 @@ def format_paper_buy_alert(buy_info: dict, signal_score: int) -> str:
     return "\n".join(lines)
 
 
-# ── Main bot loop ─────────────────────────────────────────────────────────────
+# ── Shared state (between monitoring thread and command listener) ─────────────
 
-def main():
-    log("=" * 60)
-    log(f"SN{TARGET_NETUID} {TARGET_NAME} Signal Bot starting...")
-    log("=" * 60)
+_bot_state = {
+    "latest_signal": None,
+    "latest_data": None,
+    "cycle_count": 0,
+    "started_at": time.time(),
+}
 
-    # Validate config
-    if not TAOSTATS_API_KEY:
-        log("FATAL: TAOSTATS_API_KEY not set!")
-        sys.exit(1)
-    if not TELEGRAM_BOT_TOKEN:
-        log("WARNING: Telegram bot token not set — will log only")
-    if not TELEGRAM_CHAT_ID:
-        log("WARNING: Telegram chat ID not set — will log only")
 
-    # Init DB
+def _get_cmd_conn():
+    """Get a fresh DB connection for the command listener thread."""
     from db import get_connection
-    conn = get_connection()
-    create_tables(conn)
-    log("DB tables ready.")
+    return get_connection()
 
-    # State tracking
-    last_report_ts = 0
-    last_daily_ts = 0
-    last_signal_type = None
-    cycle_count = 0
 
-    # Send startup message
-    send_telegram(
-        f"\U0001f680 SN{TARGET_NETUID} {TARGET_NAME} Signal Bot started!\n"
-        f"Monitoring every {CYCLE_INTERVAL_SECONDS // 60} minutes.\n"
-        f"Reports every {REPORT_INTERVAL_SECONDS // 3600} hours."
+# ── Telegram command handlers ────────────────────────────────────────────────
+
+def handle_status(conn) -> str:
+    """Handle /status — current snapshot with score breakdown."""
+    signal = _bot_state.get("latest_signal")
+    data = _bot_state.get("latest_data")
+
+    if not signal or not data:
+        return "\u23f3 Bot is still collecting first data cycle. Try again in a few minutes."
+
+    tao_usd = data.get("tao_price_usd", 0)
+    alpha_tao = data.get("alpha_price_tao", 0)
+    alpha_usd = alpha_tao * tao_usd
+
+    lines = [
+        f"\U0001f4ca SN{TARGET_NETUID} Status \u2014 {signal.signal_type} ({signal.total_score}/100)",
+        "\u2501" * 20,
+        f"\U0001f4c8 Emission: {data.get('emission_pct', 0) * 100:.1f}%",
+        f"\U0001f4b0 Flows: 1d {_flow_fmt(data.get('net_flow_1d', 0))} | 7d {_flow_fmt(data.get('net_flow_7d', 0))} | 30d {_flow_fmt(data.get('net_flow_30d', 0))} TAO",
+        f"\u26cf Miners: {data.get('active_miners', 0)} | \U0001f465 Validators: {data.get('active_validators', 0)}",
+        f"\U0001f48e Alpha: {alpha_tao:.4f} TAO (${alpha_usd:.2f}) | TAO: ${tao_usd:.2f}",
+        f"\U0001f3c6 Flow Rank: #{data.get('flow_rank', 'N/A')}",
+        "",
+        "SCORE BREAKDOWN:",
+    ]
+
+    for ind in signal.indicators:
+        bar = _progress_bar(ind.score, ind.max_score)
+        lines.append(f"{bar} {ind.name}: {ind.score}/{ind.max_score} \u2014 {ind.detail}")
+
+    # Portfolio
+    try:
+        conn.sync()
+    except Exception:
+        pass
+    portfolio = get_portfolio(conn)
+    if portfolio["total_invested_usd"] > 0:
+        n_pos = get_position_count(conn)
+        pnl_pct = portfolio["current_pnl_pct"]
+        pnl_usd = portfolio["total_invested_usd"] * (pnl_pct / 100)
+        lines.append("")
+        lines.append(f"\U0001f4e6 Portfolio: ${portfolio['total_invested_usd']:.0f} invested ({n_pos}/{DCA_MAX_TRANCHES} tranches)")
+        lines.append(f"Avg: {portfolio['avg_entry_price_tao']:.4f} \u2192 Now: {alpha_tao:.4f} TAO ({pnl_pct:+.1f}% / ${pnl_usd:+.2f})")
+
+    return "\n".join(lines)
+
+
+def handle_trades(conn) -> str:
+    """Handle /trades — paper trading log with portfolio summary."""
+    try:
+        conn.sync()
+    except Exception:
+        pass
+
+    res = conn.execute(
+        "SELECT timestamp, action, amount_usd, amount_tao, alpha_price_tao, "
+        "tao_price_usd, signal_score, notes FROM sn64_positions ORDER BY timestamp ASC"
     )
+    rows = res.fetchall()
+
+    if not rows:
+        return "\U0001f4cb No paper trades yet. Bot will auto-buy when score \u226570."
+
+    lines = [
+        f"\U0001f4cb SN{TARGET_NETUID} Paper Trades",
+        "\u2501" * 20,
+    ]
+
+    for i, row in enumerate(rows):
+        ts = datetime.fromtimestamp(row[0], tz=timezone.utc).strftime("%b %d %H:%M")
+        action = row[1]
+        amt_usd = float(row[2] or 0)
+        amt_tao = float(row[3] or 0)
+        alpha_price = float(row[4] or 0)
+        score = int(row[6] or 0)
+        lines.append(
+            f"{i+1}. {ts} \u2014 {action} ${amt_usd:.0f} | {amt_tao:.4f} TAO at {alpha_price:.4f} TAO/\u03b1 | Score: {score}"
+        )
+
+    # Portfolio summary
+    portfolio = get_portfolio(conn)
+    if portfolio["total_invested_usd"] > 0:
+        data = _bot_state.get("latest_data") or {}
+        alpha_tao = data.get("alpha_price_tao", 0)
+        pnl_pct = portfolio["current_pnl_pct"]
+        pnl_usd = portfolio["total_invested_usd"] * (pnl_pct / 100)
+        lines.append("")
+        lines.append(f"Portfolio: ${portfolio['total_invested_usd']:.0f} invested | {portfolio['total_alpha_tokens']:.2f} \u03b1 tokens")
+        lines.append(f"Avg entry: {portfolio['avg_entry_price_tao']:.4f} TAO | Current: {alpha_tao:.4f} TAO")
+        lines.append(f"P&L: {pnl_pct:+.1f}% (${pnl_usd:+.2f})")
+
+    # Cooldown info
+    last_buy_ts = get_last_buy_timestamp(conn)
+    if last_buy_ts > 0:
+        elapsed_h = (time.time() - last_buy_ts) / 3600
+        if elapsed_h < DCA_COOLDOWN_HOURS:
+            remaining = DCA_COOLDOWN_HOURS - elapsed_h
+            lines.append(f"\n\u23f3 Next buy cooldown: {remaining:.1f}h remaining")
+        else:
+            lines.append(f"\n\u2705 Cooldown clear \u2014 next buy eligible")
+
+    return "\n".join(lines)
+
+
+def handle_history(conn) -> str:
+    """Handle /history — 24h and 7d score/emission trends."""
+    try:
+        conn.sync()
+    except Exception:
+        pass
+
+    lines = [
+        f"\U0001f4c8 SN{TARGET_NETUID} History (24h)",
+        "\u2501" * 20,
+        "<code>Time          Score  Signal       Em%     Flow7d</code>",
+    ]
+
+    # 24h: sample at ~6h intervals
+    history = get_history(conn, limit=96)
+    if history and len(history) >= 2:
+        step = max(1, len(history) // 4)
+        samples = history[::step][:5]
+        samples.reverse()  # Oldest first
+        for h in samples:
+            ts = datetime.fromtimestamp(h["timestamp"], tz=timezone.utc).strftime("%H:%M UTC")
+            score = int(h.get("signal_score", 0))
+            sig = score_to_signal(score)
+            em = h.get("emission_pct", 0) * 100
+            f7d = h.get("net_flow_7d", 0) * RAO_TO_TAO
+            lines.append(f"<code>{ts:14s}{score:<7d}{sig:13s}{em:<8.1f}{f7d:+,.0f}</code>")
+    else:
+        lines.append("No 24h data yet.")
+
+    # 7d history
+    lines.append("")
+    lines.append(f"\U0001f4c8 SN{TARGET_NETUID} History (7d)")
+    lines.append("\u2501" * 20)
+    lines.append("<code>Date          Score  Signal       Em%     Flow7d</code>")
+
+    history_7d = get_history(conn, limit=672)
+    if history_7d and len(history_7d) > 6:
+        step = max(1, len(history_7d) // 7)
+        samples = history_7d[::step][:7]
+        samples.reverse()
+        for h in samples:
+            ts = datetime.fromtimestamp(h["timestamp"], tz=timezone.utc).strftime("%a %b %d")
+            score = int(h.get("signal_score", 0))
+            sig = score_to_signal(score)
+            em = h.get("emission_pct", 0) * 100
+            f7d = h.get("net_flow_7d", 0) * RAO_TO_TAO
+            lines.append(f"<code>{ts:14s}{score:<7d}{sig:13s}{em:<8.1f}{f7d:+,.0f}</code>")
+    else:
+        lines.append("Insufficient data for 7d view.")
+
+    return "\n".join(lines)
+
+
+def handle_analysis(conn) -> str:
+    """Handle /analysis — deep narrative interpretation of all indicators."""
+    signal = _bot_state.get("latest_signal")
+    data = _bot_state.get("latest_data")
+
+    if not signal or not data:
+        return "\u23f3 Waiting for first data cycle..."
+
+    try:
+        conn.sync()
+    except Exception:
+        pass
+
+    tao_usd = data.get("tao_price_usd", 0)
+    alpha_tao = data.get("alpha_price_tao", 0)
+
+    lines = [
+        f"\U0001f50d SN{TARGET_NETUID} Deep Analysis",
+        "\u2501" * 20,
+    ]
+
+    # Emission
+    em_pct = data.get("emission_pct", 0) * 100
+    em_ind = next((i for i in signal.indicators if i.name == "Emission Trend"), None)
+    lines.append(f"\n<b>EMISSION</b>: {em_pct:.1f}%")
+    if em_ind:
+        if em_ind.score >= 20:
+            lines.append(f"  {em_ind.detail}. Strong validator confidence \u2014 validators are actively "
+                         f"allocating weight to {TARGET_NAME}, driving emissions higher.")
+        elif em_ind.score >= 10:
+            lines.append(f"  {em_ind.detail}. Moderate \u2014 validators maintain allocation but aren't increasing it.")
+        else:
+            lines.append(f"  {em_ind.detail}. Low emission suggests validators may be shifting weight elsewhere.")
+
+    # Flows
+    f1d = data.get("net_flow_1d", 0) * RAO_TO_TAO
+    f7d = data.get("net_flow_7d", 0) * RAO_TO_TAO
+    f30d = data.get("net_flow_30d", 0) * RAO_TO_TAO
+    lines.append(f"\n<b>CAPITAL FLOWS</b>:")
+    lines.append(f"  1d: {f1d:+,.0f} TAO | 7d: {f7d:+,.0f} TAO | 30d: {f30d:+,.0f} TAO")
+    if f7d > 0 and f30d > 0:
+        if f1d > 0 and f7d != 0 and (f1d / f7d * 100) > 20:
+            lines.append("  Capital accelerating into subnet \u2014 strong buy pressure.")
+        elif f1d > 0:
+            lines.append("  Positive but decelerating inflow. Pace is slowing.")
+        else:
+            lines.append("  Short-term outflow within longer positive trend \u2014 possible profit-taking.")
+    elif f7d < 0:
+        lines.append("  Net capital outflow this week. Investors exiting \u2014 exercise caution.")
+    else:
+        lines.append("  Mixed flow signals. No clear directional conviction.")
+
+    # Network
+    miners = data.get("active_miners", 0)
+    validators = data.get("active_validators", 0)
+    miner_ind = next((i for i in signal.indicators if i.name == "Miner Health"), None)
+    lines.append(f"\n<b>NETWORK</b>: {miners} miners, {validators} validators")
+    if miner_ind:
+        lines.append(f"  {miner_ind.detail}.")
+        if miner_ind.score >= 7:
+            lines.append("  Healthy \u2014 stable or growing miner participation.")
+        else:
+            lines.append("  Declining miners \u2014 may indicate reduced profitability.")
+
+    # Validator concentration
+    hhi = data.get("validator_hhi", 0)
+    val_ind = next((i for i in signal.indicators if i.name == "Validator Concentration"), None)
+    if val_ind:
+        lines.append(f"\n<b>VALIDATOR RISK</b>: HHI = {hhi:.3f}")
+        if val_ind.score >= 7:
+            lines.append("  Well-distributed stake \u2014 low whale risk.")
+        elif val_ind.score >= 4:
+            lines.append("  Moderate concentration \u2014 a few large validators. Manageable.")
+        else:
+            lines.append("  Highly concentrated \u2014 single validator exit could impact emissions.")
+
+    # Competition
+    dom_ind = next((i for i in signal.indicators if i.name == "Relative Dominance"), None)
+    if dom_ind:
+        lines.append(f"\n<b>COMPETITION</b>: {dom_ind.detail}")
+        if dom_ind.score >= 7:
+            lines.append("  Clear emission leader \u2014 competitive moat is strong.")
+        else:
+            lines.append("  Competitors gaining ground \u2014 monitor closely.")
+
+    # Alpha price
+    price_ind = next((i for i in signal.indicators if i.name == "Alpha Price Trend"), None)
+    lines.append(f"\n<b>ALPHA PRICE</b>: {alpha_tao:.4f} TAO (${alpha_tao * tao_usd:.2f})")
+    if price_ind:
+        lines.append(f"  {price_ind.detail}.")
+
+    # Verdict
+    lines.append(f"\n<b>VERDICT</b>: {signal.signal_type} ({signal.total_score}/100)")
+    if signal.total_score >= 70:
+        lines.append("Strong fundamentals support DCA entry. Emission, flows, network all positive.")
+    elif signal.total_score >= 55:
+        lines.append("Moderate opportunity. Small accumulation warranted. Key metrics positive but not all aligned.")
+    elif signal.total_score >= 40:
+        lines.append("Mixed signals \u2014 wait for score >55 before accumulating.")
+    else:
+        lines.append("Weak conditions \u2014 avoid new positions. Fundamentals deteriorating.")
+
+    return "\n".join(lines)
+
+
+def handle_help() -> str:
+    """Handle /help — list available commands."""
+    lines = [
+        f"\U0001f916 SN{TARGET_NETUID} Signal Bot Commands",
+        "\u2501" * 20,
+        "/status \u2014 Current snapshot & score breakdown",
+        "/trades \u2014 Paper trading log & portfolio P&L",
+        "/history \u2014 Score and emission history (24h & 7d)",
+        "/analysis \u2014 Deep analysis with interpretation",
+        "/help \u2014 This message",
+        "",
+        "<b>Auto-alerts:</b>",
+        "\u2022 Signal changes (BUY\u2194WAIT\u2194EXIT transitions)",
+        "\u2022 Anomaly detection (emission drops, flow reversals)",
+        "\u2022 6-hour scheduled reports",
+        "\u2022 Daily summary at 08:00 UTC",
+        f"\u2022 Paper DCA buys (score \u226570, {DCA_MAX_TRANCHES} max tranches)",
+    ]
+    return "\n".join(lines)
+
+
+# ── Telegram command listener ────────────────────────────────────────────────
+
+def command_listener():
+    """Poll Telegram getUpdates and dispatch commands. Runs in main thread."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Command listener: No Telegram credentials \u2014 disabled. Sleeping forever.")
+        while True:
+            time.sleep(3600)
+        return
+
+    log("Command listener started (polling every 2s)...")
+    offset = 0
+    cmd_conn = _get_cmd_conn()
+    create_tables(cmd_conn)
+    authorized_chat = str(TELEGRAM_CHAT_ID)
 
     while True:
         try:
-            cycle_count += 1
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"offset": offset, "timeout": 2}
+            resp = requests.get(url, params=params, timeout=10)
+
+            if resp.status_code != 200:
+                time.sleep(5)
+                continue
+
+            updates = resp.json().get("result", [])
+
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = (msg.get("text") or "").strip()
+
+                # Only respond to authorized chat
+                if chat_id != authorized_chat:
+                    continue
+
+                if not text.startswith("/"):
+                    continue
+
+                cmd = text.split()[0].lower().split("@")[0]  # Handle /cmd@botname
+                log(f"  Command received: {cmd}")
+
+                try:
+                    # Refresh DB connection
+                    try:
+                        cmd_conn.sync()
+                    except Exception:
+                        cmd_conn = _get_cmd_conn()
+
+                    if cmd == "/status":
+                        reply = handle_status(cmd_conn)
+                    elif cmd == "/trades":
+                        reply = handle_trades(cmd_conn)
+                    elif cmd == "/history":
+                        reply = handle_history(cmd_conn)
+                    elif cmd == "/analysis":
+                        reply = handle_analysis(cmd_conn)
+                    elif cmd in ("/help", "/start"):
+                        reply = handle_help()
+                    else:
+                        reply = f"Unknown command: {cmd}\nUse /help for available commands."
+
+                    # Send reply (split if >4096 chars)
+                    if len(reply) <= 4096:
+                        send_telegram(reply)
+                    else:
+                        chunks = []
+                        current_chunk = ""
+                        for line in reply.split("\n"):
+                            if len(current_chunk) + len(line) + 1 > 4000:
+                                chunks.append(current_chunk)
+                                current_chunk = line
+                            else:
+                                current_chunk += ("\n" if current_chunk else "") + line
+                        if current_chunk:
+                            chunks.append(current_chunk)
+                        for chunk in chunks:
+                            send_telegram(chunk)
+                            time.sleep(0.5)
+
+                except Exception as e:
+                    log(f"  Error handling {cmd}: {e}")
+                    traceback.print_exc()
+                    send_telegram(f"\u274c Error processing {cmd}: {str(e)[:200]}")
+
+            time.sleep(2)
+
+        except KeyboardInterrupt:
+            log("Command listener: shutdown requested.")
+            send_telegram(f"\U0001f6d1 SN{TARGET_NETUID} Signal Bot shutting down.")
+            break
+        except Exception as e:
+            log(f"Command listener error: {e}")
+            time.sleep(10)
+            try:
+                cmd_conn = _get_cmd_conn()
+            except Exception:
+                pass
+
+
+# ── Monitoring loop ──────────────────────────────────────────────────────────
+
+def monitoring_loop():
+    """Main monitoring loop — runs in background thread."""
+    from db import get_connection
+    conn = get_connection()
+    create_tables(conn)
+    log("Monitoring loop: DB ready.")
+
+    last_report_ts = 0
+    last_daily_ts = 0
+    last_signal_type = None
+
+    while True:
+        try:
+            _bot_state["cycle_count"] += 1
+            cycle_count = _bot_state["cycle_count"]
             now = time.time()
             now_dt = datetime.now(timezone.utc)
             log(f"\n--- Cycle {cycle_count} ({now_dt.strftime('%H:%M UTC')}) ---")
@@ -477,6 +861,10 @@ def main():
             log(f"  Signal: {signal.total_score}/100 ({signal.signal_type})")
             for ind in signal.indicators:
                 log(f"    {ind.name}: {ind.score}/{ind.max_score} — {ind.detail}")
+
+            # Update shared state for command handlers
+            _bot_state["latest_signal"] = signal
+            _bot_state["latest_data"] = current_data
 
             # ── Step 4: Store reading ─────────────────────────────────────
             store_reading(conn, current_data, signal.total_score, signal.signal_type)
@@ -561,6 +949,39 @@ def main():
 
         # Wait for next cycle
         time.sleep(CYCLE_INTERVAL_SECONDS)
+
+
+# ── Main entry point ─────────────────────────────────────────────────────────
+
+def main():
+    log("=" * 60)
+    log(f"SN{TARGET_NETUID} {TARGET_NAME} Signal Bot starting...")
+    log("=" * 60)
+
+    # Validate config
+    if not TAOSTATS_API_KEY:
+        log("FATAL: TAOSTATS_API_KEY not set!")
+        sys.exit(1)
+    if not TELEGRAM_BOT_TOKEN:
+        log("WARNING: Telegram bot token not set — will log only")
+    if not TELEGRAM_CHAT_ID:
+        log("WARNING: Telegram chat ID not set — will log only")
+
+    # Send startup message
+    send_telegram(
+        f"\U0001f680 SN{TARGET_NETUID} {TARGET_NAME} Signal Bot started!\n"
+        f"Monitoring every {CYCLE_INTERVAL_SECONDS // 60} minutes.\n"
+        f"Reports every {REPORT_INTERVAL_SECONDS // 3600} hours.\n"
+        f"Commands: /status /trades /history /analysis /help"
+    )
+
+    # Start monitoring in background thread
+    monitor_thread = threading.Thread(target=monitoring_loop, daemon=True)
+    monitor_thread.start()
+    log("Monitoring thread started.")
+
+    # Run command listener in main thread (blocks)
+    command_listener()
 
 
 # ── One-shot mode for testing ─────────────────────────────────────────────────
