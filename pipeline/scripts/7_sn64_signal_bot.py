@@ -202,14 +202,23 @@ def collect_data() -> dict | None:
         data["validator_hhi"] = 0.5
         data["top_validator_stake"] = 0
 
-    # 3. TAO flow for relative ranking
-    log("  [3/4] GET dtao/tao_flow...")
-    flow_resp = api_get("api/dtao/tao_flow/v1")
-    if flow_resp and "data" in flow_resp:
-        sn64_flow_entry = next((f for f in flow_resp["data"]
-                                if f.get("netuid") == TARGET_NETUID), None)
-        if sn64_flow_entry:
-            data["tao_flow_global"] = float(sn64_flow_entry.get("tao_flow", 0))
+    # 3. Metagraph for alpha price derivation
+    log("  [3/4] GET metagraph/latest (SN64)...")
+    meta_resp = api_get("api/metagraph/latest/v1", params={"netuid": TARGET_NETUID})
+    alpha_price_tao = 0
+    if meta_resp and "data" in meta_resp:
+        neurons = meta_resp["data"]
+        # Derive alpha price from daily validation rewards ratio
+        total_alpha_rewards = 0
+        total_tao_equiv = 0
+        for n in neurons:
+            a = float(n.get("daily_validating_alpha") or 0)
+            t = float(n.get("daily_validating_alpha_as_tao") or 0)
+            total_alpha_rewards += a
+            total_tao_equiv += t
+        if total_alpha_rewards > 0 and total_tao_equiv > 0:
+            alpha_price_tao = total_tao_equiv / total_alpha_rewards
+            log(f"    Alpha price: {alpha_price_tao:.6f} TAO (${alpha_price_tao * data.get('tao_price_usd', 190):.2f})")
 
     # 4. TAO price
     log("  [4/4] GET price/latest...")
@@ -219,9 +228,8 @@ def collect_data() -> dict | None:
     else:
         data["tao_price_usd"] = 0
 
-    # Calculate alpha price from fee_rate or ema_tao_flow
-    # Alpha price approximation: use fee_rate if available as proxy
-    data["alpha_price_tao"] = data.get("fee_rate", 0)
+    # Alpha price from metagraph derivation
+    data["alpha_price_tao"] = alpha_price_tao
 
     return data
 
