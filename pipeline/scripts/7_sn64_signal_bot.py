@@ -30,6 +30,7 @@ from sn64_config import (
     DAILY_SUMMARY_HOUR_UTC,
     RAO_TO_TAO,
     DCA_MAX_TRANCHES,
+    DCA_MAX_BUDGET_USD,
     DCA_COOLDOWN_HOURS,
     score_to_signal,
 )
@@ -280,17 +281,15 @@ def format_scheduled_report(signal, current_data: dict, conn) -> str:
         bar = _progress_bar(ind.score, ind.max_score)
         lines.append(f"{bar} {ind.name}: {ind.score}/{ind.max_score}")
 
-    # Portfolio status
-    portfolio = get_portfolio(conn)
-    if portfolio["total_invested_usd"] > 0:
-        n_pos = get_position_count(conn)
-        pnl_pct = portfolio["current_pnl_pct"]
-        pnl_usd = portfolio["total_invested_usd"] * (pnl_pct / 100)
-        lines.append("")
-        lines.append(f"\U0001f4e6 Portfolio: ${portfolio['total_invested_usd']:.0f} invested ({n_pos}/{10} tranches)")
-        lines.append(f"\U0001f4ca Avg entry: {portfolio['avg_entry_price_tao']:.4f} TAO/alpha")
-        lines.append(f"\U0001f4ca Current: {alpha_tao:.4f} TAO/alpha ({pnl_pct:+.1f}%)")
-        lines.append(f"\U0001f4b5 Paper P&L: {'+' if pnl_usd >= 0 else ''}${pnl_usd:.2f}")
+    # Equity status
+    eq = _equity_summary(conn, alpha_tao, tao_usd)
+    lines.append("")
+    lines.append(f"\U0001f4b5 EQUITY:")
+    lines.append(f"  Budget: ${DCA_MAX_BUDGET_USD:.0f} | Invested: ${eq['invested']:.0f} | Available: ${eq['available']:.0f}")
+    if eq["invested"] > 0:
+        lines.append(f"  Value: ${eq['current_value']:.2f} ({eq['pnl_pct']:+.1f}% / ${eq['pnl_usd']:+.2f})")
+        lines.append(f"  Tranches: {eq['n_pos']}/{DCA_MAX_TRANCHES} | {eq['tokens']:.2f} \u03b1")
+        lines.append(f"  Avg: {eq['avg_entry']:.4f} \u2192 Now: {alpha_tao:.4f} TAO/\u03b1")
 
     lines.append("\u2501" * 20)
     return "\n".join(lines)
@@ -378,29 +377,37 @@ def format_daily_summary(conn, current_data: dict, current_score: int) -> str:
         f"7-day score average: {avg_7d} ({avg_signal})",
     ]
 
+    # Equity
+    eq = _equity_summary(conn, alpha_tao, tao_usd)
+    lines.append("")
+    lines.append(f"\U0001f4b5 Equity: ${eq['invested']:.0f} invested / ${eq['available']:.0f} available")
+    if eq["invested"] > 0:
+        lines.append(f"Value: ${eq['current_value']:.2f} ({eq['pnl_pct']:+.1f}%)")
+
     if current_score >= 70:
-        lines.append("Recommendation: Score is in BUY zone. Good time for DCA entry.")
+        lines.append("\nRecommendation: Score is in BUY zone. Good time for DCA entry.")
     elif current_score >= 55:
-        lines.append("Recommendation: Accumulate zone. Consider small positions.")
+        lines.append("\nRecommendation: Accumulate zone. Consider small positions.")
     else:
-        lines.append(f"Recommendation: Wait for score >70 for next DCA entry.")
+        lines.append(f"\nRecommendation: Wait for score >70 for next DCA entry.")
 
     return "\n".join(lines)
 
 
 def format_paper_buy_alert(buy_info: dict, signal_score: int) -> str:
     """Format paper buy execution alert."""
+    remaining = DCA_MAX_BUDGET_USD - buy_info['total_invested']
     lines = [
         f"\U0001f4b8 SN{TARGET_NETUID} PAPER BUY EXECUTED",
         "",
-        f"Tranche: {buy_info['tranche']}/{10}",
+        f"Tranche: {buy_info['tranche']}/{DCA_MAX_TRANCHES}",
         f"Amount: ${buy_info['amount_usd']:.0f} ({buy_info['amount_tao']:.4f} TAO)",
         f"Alpha price: {buy_info['alpha_price_tao']:.4f} TAO",
-        f"Tokens acquired: {buy_info['alpha_tokens']:.2f} alpha",
+        f"Tokens acquired: {buy_info['alpha_tokens']:.2f} \u03b1",
         f"TAO/USD: ${buy_info['tao_price_usd']:.2f}",
         f"Signal score: {signal_score}/100",
         "",
-        f"\U0001f4e6 Total invested: ${buy_info['total_invested']:.0f}",
+        f"\U0001f4b5 Invested: ${buy_info['total_invested']:.0f} | Available: ${remaining:.0f} | Budget: ${DCA_MAX_BUDGET_USD:.0f}",
     ]
     return "\n".join(lines)
 
@@ -428,6 +435,33 @@ def _safe_sync(conn):
         safe_sync(conn)
     except Exception:
         pass
+
+
+def _equity_summary(conn, alpha_tao: float, tao_usd: float) -> dict:
+    """Calculate equity breakdown: invested, current value, available capital."""
+    portfolio = get_portfolio(conn)
+    n_pos = get_position_count(conn)
+    invested = portfolio["total_invested_usd"]
+    tokens = portfolio["total_alpha_tokens"]
+
+    # Current value of holdings in USD
+    current_value = tokens * alpha_tao * tao_usd if alpha_tao > 0 and tao_usd > 0 else invested
+    pnl_usd = current_value - invested
+    pnl_pct = portfolio["current_pnl_pct"]
+
+    # Available capital = max budget - invested
+    available = DCA_MAX_BUDGET_USD - invested
+
+    return {
+        "invested": invested,
+        "current_value": current_value,
+        "pnl_usd": pnl_usd,
+        "pnl_pct": pnl_pct,
+        "available": available,
+        "n_pos": n_pos,
+        "tokens": tokens,
+        "avg_entry": portfolio["avg_entry_price_tao"],
+    }
 
 
 # ── Telegram command handlers ────────────────────────────────────────────────
@@ -460,16 +494,18 @@ def handle_status(conn) -> str:
         bar = _progress_bar(ind.score, ind.max_score)
         lines.append(f"{bar} {ind.name}: {ind.score}/{ind.max_score} \u2014 {ind.detail}")
 
-    # Portfolio
+    # Portfolio & Equity
     _safe_sync(conn)
-    portfolio = get_portfolio(conn)
-    if portfolio["total_invested_usd"] > 0:
-        n_pos = get_position_count(conn)
-        pnl_pct = portfolio["current_pnl_pct"]
-        pnl_usd = portfolio["total_invested_usd"] * (pnl_pct / 100)
-        lines.append("")
-        lines.append(f"\U0001f4e6 Portfolio: ${portfolio['total_invested_usd']:.0f} invested ({n_pos}/{DCA_MAX_TRANCHES} tranches)")
-        lines.append(f"Avg: {portfolio['avg_entry_price_tao']:.4f} \u2192 Now: {alpha_tao:.4f} TAO ({pnl_pct:+.1f}% / ${pnl_usd:+.2f})")
+    eq = _equity_summary(conn, alpha_tao, tao_usd)
+    lines.append("")
+    lines.append(f"\U0001f4b5 EQUITY:")
+    lines.append(f"  Budget: ${DCA_MAX_BUDGET_USD:.0f} | Invested: ${eq['invested']:.0f} | Available: ${eq['available']:.0f}")
+    if eq["invested"] > 0:
+        lines.append(f"  Value: ${eq['current_value']:.2f} ({eq['pnl_pct']:+.1f}% / ${eq['pnl_usd']:+.2f})")
+        lines.append(f"  Tranches: {eq['n_pos']}/{DCA_MAX_TRANCHES} | {eq['tokens']:.2f} \u03b1 tokens")
+        lines.append(f"  Avg: {eq['avg_entry']:.4f} \u2192 Now: {alpha_tao:.4f} TAO/\u03b1")
+    else:
+        lines.append(f"  No positions yet. Waiting for score \u226570.")
 
     return "\n".join(lines)
 
@@ -503,17 +539,17 @@ def handle_trades(conn) -> str:
             f"{i+1}. {ts} \u2014 {action} ${amt_usd:.0f} | {amt_tao:.4f} TAO at {alpha_price:.4f} TAO/\u03b1 | Score: {score}"
         )
 
-    # Portfolio summary
-    portfolio = get_portfolio(conn)
-    if portfolio["total_invested_usd"] > 0:
-        data = _bot_state.get("latest_data") or {}
-        alpha_tao = data.get("alpha_price_tao", 0)
-        pnl_pct = portfolio["current_pnl_pct"]
-        pnl_usd = portfolio["total_invested_usd"] * (pnl_pct / 100)
-        lines.append("")
-        lines.append(f"Portfolio: ${portfolio['total_invested_usd']:.0f} invested | {portfolio['total_alpha_tokens']:.2f} \u03b1 tokens")
-        lines.append(f"Avg entry: {portfolio['avg_entry_price_tao']:.4f} TAO | Current: {alpha_tao:.4f} TAO")
-        lines.append(f"P&L: {pnl_pct:+.1f}% (${pnl_usd:+.2f})")
+    # Equity summary
+    data = _bot_state.get("latest_data") or {}
+    alpha_tao = data.get("alpha_price_tao", 0)
+    tao_usd = data.get("tao_price_usd", 0)
+    eq = _equity_summary(conn, alpha_tao, tao_usd)
+    lines.append("")
+    lines.append(f"\U0001f4b5 EQUITY:")
+    lines.append(f"  Budget: ${DCA_MAX_BUDGET_USD:.0f} | Invested: ${eq['invested']:.0f} | Available: ${eq['available']:.0f}")
+    if eq["invested"] > 0:
+        lines.append(f"  Value: ${eq['current_value']:.2f} ({eq['pnl_pct']:+.1f}% / ${eq['pnl_usd']:+.2f})")
+        lines.append(f"  Avg: {eq['avg_entry']:.4f} \u2192 Now: {alpha_tao:.4f} TAO/\u03b1")
 
     # Cooldown info
     last_buy_ts = get_last_buy_timestamp(conn)
