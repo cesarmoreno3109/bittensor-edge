@@ -372,19 +372,24 @@ MAX_SCORE_CHANGE_PER_CYCLE = 8
 
 
 def get_signal_state(conn) -> dict:
-    """Read current signal state from DB."""
-    try:
-        res = conn.execute("SELECT current_signal, signal_since, display_score, last_raw_score FROM sn64_signal_state WHERE id = 1")
-        row = res.fetchone()
-        if row:
-            return {
-                "current_signal": row[0],
-                "signal_since": int(row[1]),
-                "display_score": float(row[2]),
-                "last_raw_score": float(row[3]),
-            }
-    except Exception:
-        pass
+    """Read current signal state from DB with retry for WAL contention."""
+    for attempt in range(3):
+        try:
+            res = conn.execute("SELECT current_signal, signal_since, display_score, last_raw_score FROM sn64_signal_state WHERE id = 1")
+            row = res.fetchone()
+            if row:
+                return {
+                    "current_signal": row[0],
+                    "signal_since": int(row[1]),
+                    "display_score": float(row[2]),
+                    "last_raw_score": float(row[3]),
+                }
+            break
+        except (ValueError, Exception) as e:
+            if attempt < 2 and ("wal" in str(e).lower() or "locked" in str(e).lower()):
+                time.sleep(1 + attempt)
+                continue
+            break
     return {
         "current_signal": "WAIT",
         "signal_since": 0,
@@ -394,14 +399,22 @@ def get_signal_state(conn) -> dict:
 
 
 def update_signal_state(conn, signal: str, since: int, display_score: float, raw_score: float):
-    """Update signal state in DB."""
-    conn.execute(
-        """INSERT OR REPLACE INTO sn64_signal_state
-           (id, current_signal, signal_since, display_score, last_raw_score)
-           VALUES (1, ?, ?, ?, ?)""",
-        (signal, since, display_score, raw_score),
-    )
-    conn.commit()
+    """Update signal state in DB with retry for WAL contention."""
+    for attempt in range(3):
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO sn64_signal_state
+                   (id, current_signal, signal_since, display_score, last_raw_score)
+                   VALUES (1, ?, ?, ?, ?)""",
+                (signal, since, display_score, raw_score),
+            )
+            conn.commit()
+            return
+        except (ValueError, Exception) as e:
+            if attempt < 2 and ("wal" in str(e).lower() or "locked" in str(e).lower()):
+                time.sleep(1 + attempt)
+                continue
+            raise
 
 
 def _determine_signal_with_hysteresis(display_score: float, current_signal: str) -> str:
