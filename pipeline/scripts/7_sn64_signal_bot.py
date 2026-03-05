@@ -34,7 +34,7 @@ from sn64_config import (
     DCA_COOLDOWN_HOURS,
     score_to_signal,
 )
-from sn64_signals import calculate_signal, detect_anomalies, IndicatorResult
+from sn64_signals import calculate_signal, detect_anomalies, IndicatorResult, apply_signal_smoothing, get_signal_state
 from sn64_history import (
     create_tables,
     store_reading,
@@ -263,7 +263,8 @@ def format_scheduled_report(signal, current_data: dict, conn) -> str:
         "\u2501" * 20,
         f"\U0001f4ca SN{TARGET_NETUID} {TARGET_NAME} \u2014 6H REPORT",
         "\u2501" * 20,
-        f"\U0001f522 Signal Score: <b>{signal.total_score}/100 ({signal.signal_type})</b>",
+        f"\U0001f522 Signal Score: <b>{signal.display_score}/100 ({signal.signal_type})</b> [raw: {signal.raw_score}]",
+        f"\U0001f4ca Data Quality: {signal.data_quality}",
         "",
         f"\U0001f4c8 Emission: {current_data.get('emission_pct', 0) * 100:.1f}%",
         f"\U0001f4b0 Flow 1d: {_flow_fmt(current_data.get('net_flow_1d', 0))} TAO",
@@ -478,8 +479,14 @@ def handle_status(conn) -> str:
     alpha_tao = data.get("alpha_price_tao", 0)
     alpha_usd = alpha_tao * tao_usd
 
+    # Get smoothing state for raw score display
+    raw_score = getattr(signal, 'raw_score', signal.total_score)
+    display_score = getattr(signal, 'display_score', signal.total_score)
+    data_quality = getattr(signal, 'data_quality', 'FULL')
+
     lines = [
-        f"\U0001f4ca SN{TARGET_NETUID} Status \u2014 {signal.signal_type} ({signal.total_score}/100)",
+        f"\U0001f4ca SN{TARGET_NETUID} Status \u2014 {signal.signal_type} ({display_score}/100) [raw: {raw_score}]",
+        f"\U0001f4ca Data: {data_quality}",
         "\u2501" * 20,
         f"\U0001f4c8 Emission: {data.get('emission_pct', 0) * 100:.1f}%",
         f"\U0001f4b0 Flows: 1d {_flow_fmt(data.get('net_flow_1d', 0))} | 7d {_flow_fmt(data.get('net_flow_7d', 0))} | 30d {_flow_fmt(data.get('net_flow_30d', 0))} TAO",
@@ -487,7 +494,7 @@ def handle_status(conn) -> str:
         f"\U0001f48e Alpha: {alpha_tao:.4f} TAO (${alpha_usd:.2f}) | TAO: ${tao_usd:.2f}",
         f"\U0001f3c6 Flow Rank: #{data.get('flow_rank', 'N/A')}",
         "",
-        "SCORE BREAKDOWN:",
+        "SCORE BREAKDOWN (smoothed):",
     ]
 
     for ind in signal.indicators:
@@ -521,7 +528,7 @@ def handle_trades(conn) -> str:
     rows = res.fetchall()
 
     if not rows:
-        return "\U0001f4cb No paper trades yet. Bot will auto-buy when score \u226570."
+        return "\U0001f4cb No paper trades yet. Bot will auto-buy when display score \u226575 for 6h+."
 
     lines = [
         f"\U0001f4cb SN{TARGET_NETUID} Paper Trades",
@@ -703,8 +710,11 @@ def handle_analysis(conn) -> str:
         lines.append(f"  {price_ind.detail}.")
 
     # Verdict
-    lines.append(f"\n<b>VERDICT</b>: {signal.signal_type} ({signal.total_score}/100)")
-    if signal.total_score >= 70:
+    raw_s = getattr(signal, 'raw_score', signal.total_score)
+    disp_s = getattr(signal, 'display_score', signal.total_score)
+    dq = getattr(signal, 'data_quality', 'FULL')
+    lines.append(f"\n<b>VERDICT</b>: {signal.signal_type} ({disp_s}/100) [raw: {raw_s}] [{dq}]")
+    if disp_s >= 70:
         lines.append("Strong fundamentals support DCA entry. Emission, flows, network all positive.")
     elif signal.total_score >= 55:
         lines.append("Moderate opportunity. Small accumulation warranted. Key metrics positive but not all aligned.")
@@ -728,11 +738,17 @@ def handle_help() -> str:
         "/help \u2014 This message",
         "",
         "<b>Auto-alerts:</b>",
-        "\u2022 Signal changes (BUY\u2194WAIT\u2194EXIT transitions)",
+        "\u2022 Signal changes (hysteresis + 6h hold time)",
         "\u2022 Anomaly detection (emission drops, flow reversals)",
         "\u2022 6-hour scheduled reports",
         "\u2022 Daily summary at 08:00 UTC",
-        f"\u2022 Paper DCA buys (score \u226570, {DCA_MAX_TRANCHES} max tranches)",
+        f"\u2022 Paper DCA buys (display score \u226575 for 6h+, {DCA_MAX_TRANCHES} max)",
+        "",
+        "<b>Calibration v2:</b>",
+        "\u2022 Smoothed moving averages (4-24h windows)",
+        "\u2022 Score rate limiter (\u00b18 pts/cycle max)",
+        "\u2022 Hysteresis bands (\u00b15 pts to change signal)",
+        "\u2022 6h minimum hold time per signal level",
     ]
     return "\n".join(lines)
 
@@ -850,7 +866,6 @@ def monitoring_loop():
 
     last_report_ts = 0
     last_daily_ts = 0
-    last_signal_type = None
 
     while True:
         try:
@@ -883,24 +898,60 @@ def monitoring_loop():
             history = get_history(conn)
             previous = get_previous_reading(conn)
 
-            # ── Step 3: Calculate signal ──────────────────────────────────
-            log("Calculating signal...")
+            # ── Step 3: Calculate signal (smoothed indicators) ─────────────
+            log("Calculating signal (smoothed)...")
             signal = calculate_signal(
                 current_data,
                 [current_data] + history,  # Include current as first element
                 current_data.get("validator_hhi", 0.5),
                 current_data.get("second_emission", 0),
             )
-            log(f"  Signal: {signal.total_score}/100 ({signal.signal_type})")
+
+            # Handle CALIBRATING state
+            if signal.data_quality == "CALIBRATING":
+                n_readings = len(history) + 1
+                log(f"  CALIBRATING: {n_readings}/24 readings. Need 6h of data.")
+                if cycle_count == 1:
+                    send_telegram(
+                        f"\u2699\ufe0f SN{TARGET_NETUID} Bot is calibrating.\n"
+                        f"Need 6h of data ({n_readings}/24 readings).\n"
+                        f"No signals will be generated until calibration completes."
+                    )
+                _bot_state["latest_signal"] = signal
+                _bot_state["latest_data"] = current_data
+                store_reading(conn, current_data, 50, "CALIBRATING")
+                time.sleep(CYCLE_INTERVAL_SECONDS)
+                continue
+
+            raw_score = signal.raw_score
+            log(f"  Raw score: {raw_score}/100 ({signal.signal_type}) [{signal.data_quality}]")
             for ind in signal.indicators:
-                log(f"    {ind.name}: {ind.score}/{ind.max_score} — {ind.detail}")
+                log(f"    {ind.name}: {ind.score}/{ind.max_score} \u2014 {ind.detail}")
+
+            # ── Step 3b: Apply anti-flicker smoothing ─────────────────────
+            prev_state = get_signal_state(conn)
+            prev_signal_type = prev_state["current_signal"]
+            prev_display_score = prev_state["display_score"]
+
+            display_score, display_signal, signal_changed = apply_signal_smoothing(
+                conn, raw_score, signal.signal_type
+            )
+
+            log(f"  Smoothed: {display_score}/100 ({display_signal}) [raw: {raw_score}]")
+            if display_score != raw_score:
+                log(f"    Rate limiter: {prev_display_score:.0f} \u2192 {display_score} (raw wanted {raw_score})")
+
+            # Update signal object with smoothed values
+            signal.display_score = display_score
+            signal.total_score = display_score
+            signal.signal_type = display_signal
 
             # Update shared state for command handlers
             _bot_state["latest_signal"] = signal
             _bot_state["latest_data"] = current_data
 
-            # ── Step 4: Store reading ─────────────────────────────────────
-            store_reading(conn, current_data, signal.total_score, signal.signal_type)
+            # ── Step 4: Store reading (with display score) ────────────────
+            store_reading(conn, current_data, display_score, display_signal)
 
             # ── Step 5: Check for anomalies ───────────────────────────────
             anomalies = detect_anomalies(current_data, previous)
@@ -909,37 +960,47 @@ def monitoring_loop():
                 old_score = int(previous.get("signal_score", 0)) if previous else 0
                 for a in anomalies:
                     log(f"    [{a.anomaly_type}] {a.detail}")
-                    msg = format_anomaly_alert(a, old_score, signal.total_score)
+                    msg = format_anomaly_alert(a, old_score, display_score)
                     send_telegram(msg)
 
-            # ── Step 6: Check for signal threshold crossing ───────────────
-            if previous and last_signal_type:
-                old_score = int(previous.get("signal_score", 0))
-                old_signal = score_to_signal(old_score)
-                if signal.signal_type != old_signal:
-                    log(f"  Signal change: {old_signal}→{signal.signal_type}")
-                    changed = [ind.detail for ind in signal.indicators
-                               if ind.score > 0]
-                    msg = format_signal_change(
-                        old_score, old_signal,
-                        signal.total_score, signal.signal_type,
-                        changed,
-                    )
-                    send_telegram(msg)
+            # ── Step 6: Signal change alert (ONLY after smoothing) ────────
+            if signal_changed:
+                log(f"  SIGNAL CHANGE: {prev_signal_type} \u2192 {display_signal}")
+                changed = [ind.detail for ind in signal.indicators
+                           if ind.score > 0]
+                msg = format_signal_change(
+                    int(prev_display_score), prev_signal_type,
+                    display_score, display_signal,
+                    changed,
+                )
+                send_telegram(msg)
 
-            last_signal_type = signal.signal_type
-
-            # ── Step 7: Check paper buy conditions ────────────────────────
+            # ── Step 7: Check paper buy (strict thresholds) ───────────────
             alpha_price = current_data.get("alpha_price_tao", 0)
             tao_price = current_data.get("tao_price_usd", 0)
             if alpha_price > 0:
                 update_portfolio_pnl(conn, alpha_price)
 
-            buy_info = execute_paper_buy(conn, alpha_price, tao_price, signal.total_score)
-            if buy_info:
-                log(f"  Paper buy executed: tranche {buy_info['tranche']}")
-                msg = format_paper_buy_alert(buy_info, signal.total_score)
-                send_telegram(msg)
+            # Paper buy requires: display_score >= 75, signal == BUY for 6h+
+            state_now = get_signal_state(conn)
+            hold_duration = int(time.time()) - state_now["signal_since"] if state_now["signal_since"] > 0 else 0
+            buy_eligible = (
+                display_score >= 75
+                and display_signal in ("BUY", "STRONG BUY")
+                and hold_duration >= 6 * 3600  # 6h confirmed trend
+            )
+
+            if buy_eligible:
+                buy_info = execute_paper_buy(conn, alpha_price, tao_price, display_score)
+                if buy_info:
+                    log(f"  Paper buy executed: tranche {buy_info['tranche']} (confirmed 6h+ BUY)")
+                    msg = format_paper_buy_alert(buy_info, display_score)
+                    send_telegram(msg)
+            else:
+                if display_score >= 70:
+                    log(f"  Paper buy: score {display_score} but signal '{display_signal}' held {hold_duration//3600}h (need 6h BUY)")
+                # Still call execute_paper_buy with score 0 to skip — it checks internally
+                # No action needed here
 
             # ── Step 8: Scheduled report (every 6h) ───────────────────────
             if now - last_report_ts >= REPORT_INTERVAL_SECONDS:
@@ -1003,6 +1064,7 @@ def main():
     # Send startup message
     send_telegram(
         f"\U0001f680 SN{TARGET_NETUID} {TARGET_NAME} Signal Bot started!\n"
+        f"\u2699\ufe0f Calibration v2: smoothed indicators + anti-flicker\n"
         f"Monitoring every {CYCLE_INTERVAL_SECONDS // 60} minutes.\n"
         f"Reports every {REPORT_INTERVAL_SECONDS // 3600} hours.\n"
         f"Commands: /status /trades /history /analysis /help"
@@ -1048,8 +1110,8 @@ def run_once():
     previous = get_previous_reading(conn)
     log(f"\nHistory: {len(history)} past readings")
 
-    # Signal
-    log("\nCalculating signal...")
+    # Signal (smoothed)
+    log("\nCalculating signal (smoothed v2)...")
     signal = calculate_signal(
         current_data,
         [current_data] + history,
@@ -1058,14 +1120,32 @@ def run_once():
     )
 
     log(f"\n{'='*50}")
-    log(f"SIGNAL: {signal.total_score}/100 ({signal.signal_type})")
+    log(f"RAW SCORE: {signal.raw_score}/100 ({signal.signal_type}) [{signal.data_quality}]")
     log(f"{'='*50}")
-    for ind in signal.indicators:
-        bar = _progress_bar(ind.score, ind.max_score)
-        log(f"  {bar} {ind.name}: {ind.score}/{ind.max_score} — {ind.detail}")
+    if signal.indicators:
+        for ind in signal.indicators:
+            bar = _progress_bar(ind.score, ind.max_score)
+            log(f"  {bar} {ind.name}: {ind.score}/{ind.max_score} — {ind.detail}")
+    else:
+        log("  (CALIBRATING — no indicators yet)")
+
+    # Apply anti-flicker smoothing
+    if signal.data_quality != "CALIBRATING":
+        display_score, display_signal, changed = apply_signal_smoothing(
+            conn, signal.raw_score, signal.signal_type
+        )
+        log(f"\nSMOOTHED: {display_score}/100 ({display_signal}) [raw: {signal.raw_score}]")
+        if changed:
+            log(f"  *** SIGNAL CHANGED ***")
+        signal.display_score = display_score
+        signal.total_score = display_score
+        signal.signal_type = display_signal
+    else:
+        display_score = 50
+        display_signal = "CALIBRATING"
 
     # Store
-    store_reading(conn, current_data, signal.total_score, signal.signal_type)
+    store_reading(conn, current_data, display_score, display_signal)
     log("\nReading stored to DB.")
 
     # Anomalies

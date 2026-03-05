@@ -55,6 +55,13 @@ SCHEMA_SQL = [
         current_pnl_pct REAL DEFAULT 0,
         last_updated INTEGER
     )""",
+    """CREATE TABLE IF NOT EXISTS sn64_signal_state (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        current_signal TEXT DEFAULT 'WAIT',
+        signal_since INTEGER DEFAULT 0,
+        display_score REAL DEFAULT 50,
+        last_raw_score REAL DEFAULT 50
+    )""",
 ]
 
 
