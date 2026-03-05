@@ -421,6 +421,15 @@ def _get_cmd_conn():
     return get_connection()
 
 
+def _safe_sync(conn):
+    """Sync DB with retry for WAL lock contention."""
+    from db import safe_sync
+    try:
+        safe_sync(conn)
+    except Exception:
+        pass
+
+
 # ── Telegram command handlers ────────────────────────────────────────────────
 
 def handle_status(conn) -> str:
@@ -452,10 +461,7 @@ def handle_status(conn) -> str:
         lines.append(f"{bar} {ind.name}: {ind.score}/{ind.max_score} \u2014 {ind.detail}")
 
     # Portfolio
-    try:
-        conn.sync()
-    except Exception:
-        pass
+    _safe_sync(conn)
     portfolio = get_portfolio(conn)
     if portfolio["total_invested_usd"] > 0:
         n_pos = get_position_count(conn)
@@ -470,10 +476,7 @@ def handle_status(conn) -> str:
 
 def handle_trades(conn) -> str:
     """Handle /trades — paper trading log with portfolio summary."""
-    try:
-        conn.sync()
-    except Exception:
-        pass
+    _safe_sync(conn)
 
     res = conn.execute(
         "SELECT timestamp, action, amount_usd, amount_tao, alpha_price_tao, "
@@ -527,10 +530,7 @@ def handle_trades(conn) -> str:
 
 def handle_history(conn) -> str:
     """Handle /history — 24h and 7d score/emission trends."""
-    try:
-        conn.sync()
-    except Exception:
-        pass
+    _safe_sync(conn)
 
     lines = [
         f"\U0001f4c8 SN{TARGET_NETUID} History (24h)",
@@ -586,10 +586,7 @@ def handle_analysis(conn) -> str:
     if not signal or not data:
         return "\u23f3 Waiting for first data cycle..."
 
-    try:
-        conn.sync()
-    except Exception:
-        pass
+    _safe_sync(conn)
 
     tao_usd = data.get("tao_price_usd", 0)
     alpha_tao = data.get("alpha_price_tao", 0)
@@ -751,7 +748,7 @@ def command_listener():
                 try:
                     # Refresh DB connection
                     try:
-                        cmd_conn.sync()
+                        _safe_sync(cmd_conn)
                     except Exception:
                         cmd_conn = _get_cmd_conn()
 
@@ -843,7 +840,7 @@ def monitoring_loop():
             # ── Step 2: Get history for trend analysis ────────────────────
             # Refresh connection before reads to avoid stale streams
             try:
-                conn.sync()
+                _safe_sync(conn)
             except Exception:
                 conn = get_connection()
 
