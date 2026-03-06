@@ -3,6 +3,9 @@
 
 Runs as a systemd service. Collects data every 15 minutes from TaoStats API,
 calculates composite signal scores, and sends alerts via Telegram.
+
+Connection strategy: fresh DB connection per cycle / per command to avoid
+stale Hrana streams and WAL lock contention.
 """
 
 import sys
@@ -423,19 +426,19 @@ _bot_state = {
 }
 
 
-def _get_cmd_conn():
-    """Get a fresh DB connection for the command listener thread."""
-    from db import get_connection
-    return get_connection()
+def _get_fresh_conn():
+    """Get a fresh DB connection with retry logic."""
+    from db import get_connection_with_retry
+    return get_connection_with_retry()
 
 
-def _safe_sync(conn):
-    """Sync DB with retry for WAL lock contention."""
-    from db import safe_sync
-    try:
-        safe_sync(conn)
-    except Exception:
-        pass
+def _close_conn(conn):
+    """Safely close a DB connection."""
+    if conn:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _equity_summary(conn, alpha_tao: float, tao_usd: float) -> dict:
@@ -502,7 +505,6 @@ def handle_status(conn) -> str:
         lines.append(f"{bar} {ind.name}: {ind.score}/{ind.max_score} \u2014 {ind.detail}")
 
     # Portfolio & Equity
-    _safe_sync(conn)
     eq = _equity_summary(conn, alpha_tao, tao_usd)
     lines.append("")
     lines.append(f"\U0001f4b5 EQUITY:")
@@ -519,8 +521,6 @@ def handle_status(conn) -> str:
 
 def handle_trades(conn) -> str:
     """Handle /trades — paper trading log with portfolio summary."""
-    _safe_sync(conn)
-
     res = conn.execute(
         "SELECT timestamp, action, amount_usd, amount_tao, alpha_price_tao, "
         "tao_price_usd, signal_score, notes FROM sn64_positions ORDER BY timestamp ASC"
@@ -573,8 +573,6 @@ def handle_trades(conn) -> str:
 
 def handle_history(conn) -> str:
     """Handle /history — 24h and 7d score/emission trends."""
-    _safe_sync(conn)
-
     lines = [
         f"\U0001f4c8 SN{TARGET_NETUID} History (24h)",
         "\u2501" * 20,
@@ -628,8 +626,6 @@ def handle_analysis(conn) -> str:
 
     if not signal or not data:
         return "\u23f3 Waiting for first data cycle..."
-
-    _safe_sync(conn)
 
     tao_usd = data.get("tao_price_usd", 0)
     alpha_tao = data.get("alpha_price_tao", 0)
@@ -749,6 +745,7 @@ def handle_help() -> str:
         "\u2022 Score rate limiter (\u00b18 pts/cycle max)",
         "\u2022 Hysteresis bands (\u00b15 pts to change signal)",
         "\u2022 6h minimum hold time per signal level",
+        "\u2022 Fresh DB connections per cycle (WAL-safe)",
     ]
     return "\n".join(lines)
 
@@ -756,7 +753,11 @@ def handle_help() -> str:
 # ── Telegram command listener ────────────────────────────────────────────────
 
 def command_listener():
-    """Poll Telegram getUpdates and dispatch commands. Runs in main thread."""
+    """Poll Telegram getUpdates and dispatch commands. Runs in main thread.
+
+    Each command gets its own fresh DB connection that is closed immediately
+    after use, to prevent stale Hrana streams.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("Command listener: No Telegram credentials \u2014 disabled. Sleeping forever.")
         while True:
@@ -765,8 +766,6 @@ def command_listener():
 
     log("Command listener started (polling every 2s)...")
     offset = 0
-    cmd_conn = _get_cmd_conn()
-    create_tables(cmd_conn)
     authorized_chat = str(TELEGRAM_CHAT_ID)
 
     while True:
@@ -797,12 +796,11 @@ def command_listener():
                 cmd = text.split()[0].lower().split("@")[0]  # Handle /cmd@botname
                 log(f"  Command received: {cmd}")
 
+                # Fresh connection for each command
+                cmd_conn = None
                 try:
-                    # Refresh DB connection
-                    try:
-                        _safe_sync(cmd_conn)
-                    except Exception:
-                        cmd_conn = _get_cmd_conn()
+                    cmd_conn = _get_fresh_conn()
+                    create_tables(cmd_conn)
 
                     if cmd == "/status":
                         reply = handle_status(cmd_conn)
@@ -839,6 +837,8 @@ def command_listener():
                     log(f"  Error handling {cmd}: {e}")
                     traceback.print_exc()
                     send_telegram(f"\u274c Error processing {cmd}: {str(e)[:200]}")
+                finally:
+                    _close_conn(cmd_conn)
 
             time.sleep(2)
 
@@ -849,25 +849,91 @@ def command_listener():
         except Exception as e:
             log(f"Command listener error: {e}")
             time.sleep(10)
-            try:
-                cmd_conn = _get_cmd_conn()
-            except Exception:
-                pass
+
+
+# ── Error rate limiting for Telegram alerts ──────────────────────────────────
+
+class ErrorTracker:
+    """Track errors and rate-limit Telegram notifications.
+
+    - First error: send immediately
+    - Subsequent errors: send summary every 1 hour
+    - On recovery: send recovery message
+    """
+    def __init__(self):
+        self.error_count = 0
+        self.first_error_time = None
+        self.last_alert_time = None
+        self.last_error_msg = ""
+
+    def on_error(self, cycle_count: int, error: str):
+        """Called when a cycle fails. Returns True if Telegram alert should be sent."""
+        now = time.time()
+        self.error_count += 1
+        self.last_error_msg = str(error)[:200]
+
+        if self.error_count == 1:
+            # First error — send immediately
+            self.first_error_time = now
+            self.last_alert_time = now
+            send_telegram(
+                f"\u274c SN{TARGET_NETUID} Bot Error\n\n"
+                f"Cycle {cycle_count}: {self.last_error_msg}\n\n"
+                f"Bot will retry in {CYCLE_INTERVAL_SECONDS // 60} minutes."
+            )
+        elif now - self.last_alert_time >= 3600:
+            # Hourly summary
+            hours = (now - self.first_error_time) / 3600
+            self.last_alert_time = now
+            send_telegram(
+                f"\u274c SN{TARGET_NETUID} Still Failing\n\n"
+                f"Failing for {hours:.1f}h ({self.error_count} cycles)\n"
+                f"Last error: {self.last_error_msg}\n\n"
+                f"Bot continues retrying every {CYCLE_INTERVAL_SECONDS // 60} minutes."
+            )
+
+    def on_recovery(self, cycle_count: int):
+        """Called when a cycle succeeds after errors."""
+        if self.error_count > 0:
+            hours = (time.time() - self.first_error_time) / 3600 if self.first_error_time else 0
+            send_telegram(
+                f"\u2705 SN{TARGET_NETUID} Bot Recovered\n\n"
+                f"Recovered after {self.error_count} failed cycles ({hours:.1f}h downtime)\n"
+                f"Resuming normal operation at cycle {cycle_count}."
+            )
+            self.error_count = 0
+            self.first_error_time = None
+            self.last_alert_time = None
+            self.last_error_msg = ""
 
 
 # ── Monitoring loop ──────────────────────────────────────────────────────────
 
 def monitoring_loop():
-    """Main monitoring loop — runs in background thread."""
-    from db import get_connection
-    conn = get_connection()
-    create_tables(conn)
-    log("Monitoring loop: DB ready.")
+    """Main monitoring loop — runs in background thread.
+
+    Creates a FRESH DB connection at the start of each cycle and closes it
+    at the end, to prevent stale Hrana streams and WAL lock buildup.
+    """
+    from db import get_connection_with_retry, safe_sync
+
+    # Ensure tables exist with a throwaway connection
+    init_conn = None
+    try:
+        init_conn = get_connection_with_retry()
+        create_tables(init_conn)
+        log("Monitoring loop: DB ready (tables verified).")
+    except Exception as e:
+        log(f"Monitoring loop: DB init failed: {e}")
+    finally:
+        _close_conn(init_conn)
 
     last_report_ts = 0
     last_daily_ts = 0
+    error_tracker = ErrorTracker()
 
     while True:
+        conn = None
         try:
             _bot_state["cycle_count"] += 1
             cycle_count = _bot_state["cycle_count"]
@@ -888,12 +954,9 @@ def monitoring_loop():
             log(f"  Miners: {current_data.get('active_miners', 0)}")
             log(f"  TAO/USD: ${current_data.get('tao_price_usd', 0):.2f}")
 
-            # ── Step 2: Get history for trend analysis ────────────────────
-            # Refresh connection before reads to avoid stale streams
-            try:
-                _safe_sync(conn)
-            except Exception:
-                conn = get_connection()
+            # ── Step 2: Fresh DB connection for this cycle ─────────────────
+            conn = get_connection_with_retry()
+            log("  DB connection: fresh")
 
             history = get_history(conn)
             previous = get_previous_reading(conn)
@@ -920,6 +983,10 @@ def monitoring_loop():
                 _bot_state["latest_signal"] = signal
                 _bot_state["latest_data"] = current_data
                 store_reading(conn, current_data, 50, "CALIBRATING")
+                # Mark recovery if we had errors
+                error_tracker.on_recovery(cycle_count)
+                _close_conn(conn)
+                conn = None
                 time.sleep(CYCLE_INTERVAL_SECONDS)
                 continue
 
@@ -999,8 +1066,6 @@ def monitoring_loop():
             else:
                 if display_score >= 70:
                     log(f"  Paper buy: score {display_score} but signal '{display_signal}' held {hold_duration//3600}h (need 6h BUY)")
-                # Still call execute_paper_buy with score 0 to skip — it checks internally
-                # No action needed here
 
             # ── Step 8: Scheduled report (every 6h) ───────────────────────
             if now - last_report_ts >= REPORT_INTERVAL_SECONDS:
@@ -1018,28 +1083,24 @@ def monitoring_loop():
 
             log(f"Cycle {cycle_count} complete. Next in {CYCLE_INTERVAL_SECONDS // 60}m.")
 
+            # Cycle succeeded — notify recovery if there were errors
+            error_tracker.on_recovery(cycle_count)
+
         except KeyboardInterrupt:
             log("Shutdown requested (Ctrl+C).")
             send_telegram(f"\U0001f6d1 SN{TARGET_NETUID} Signal Bot shutting down.")
             break
         except Exception as e:
+            cycle_count = _bot_state.get("cycle_count", 0)
             log(f"ERROR in cycle {cycle_count}: {e}")
             log(traceback.format_exc())
-            # Try to send error notification
-            try:
-                send_telegram(
-                    f"\u274c SN{TARGET_NETUID} Bot Error\n\n"
-                    f"Cycle {cycle_count}: {str(e)[:200]}\n\n"
-                    f"Bot will retry in {CYCLE_INTERVAL_SECONDS // 60} minutes."
-                )
-            except Exception:
-                pass
+            # Rate-limited error notification
+            error_tracker.on_error(cycle_count, e)
 
-            # Reconnect DB on error
-            try:
-                conn = get_connection()
-            except Exception:
-                pass
+        finally:
+            # ALWAYS close the connection at end of cycle
+            _close_conn(conn)
+            conn = None
 
         # Wait for next cycle
         time.sleep(CYCLE_INTERVAL_SECONDS)
@@ -1065,6 +1126,7 @@ def main():
     send_telegram(
         f"\U0001f680 SN{TARGET_NETUID} {TARGET_NAME} Signal Bot started!\n"
         f"\u2699\ufe0f Calibration v2: smoothed indicators + anti-flicker\n"
+        f"\U0001f527 Connection: fresh per cycle (WAL-safe)\n"
         f"Monitoring every {CYCLE_INTERVAL_SECONDS // 60} minutes.\n"
         f"Reports every {REPORT_INTERVAL_SECONDS // 3600} hours.\n"
         f"Commands: /status /trades /history /analysis /help"
@@ -1087,8 +1149,7 @@ def run_once():
     log(f"SN{TARGET_NETUID} {TARGET_NAME} Signal Bot — ONE SHOT TEST")
     log("=" * 60)
 
-    from db import get_connection
-    conn = get_connection()
+    conn = _get_fresh_conn()
     create_tables(conn)
 
     # Collect
@@ -1096,6 +1157,7 @@ def run_once():
     current_data = collect_data()
     if not current_data:
         log("FAILED to collect data!")
+        _close_conn(conn)
         return
 
     log("\nRaw data collected:")
@@ -1162,7 +1224,7 @@ def run_once():
     report = format_scheduled_report(signal, current_data, conn)
     print(report)
 
-    conn.close()
+    _close_conn(conn)
     return signal, current_data
 
 
